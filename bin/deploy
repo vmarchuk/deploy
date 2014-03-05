@@ -1,0 +1,2444 @@
+#!/usr/bin/env perl
+# Deploy via torrent 
+#
+
+# Modules that need to be installed as part of perl
+use Data::Dumper;
+use Proc::Daemon;
+use File::Path;
+use File::Copy;
+use Time::Local (timelocal);
+use Date::Manip;
+use JSON::Any;
+use bytes;
+use File::Basename;
+use Cwd;
+use JSON::RPC::Client;
+
+use sigtrap 'handler' => \&shutdown, 'normal-signals';
+use sigtrap 'handler' => \&shutdown, 'error-signals'; 
+
+our $SELF = Cwd::abs_path($0);
+our $PREFIX=dirname(dirname($SELF));
+our $LIB="$PREFIX/lib";
+$ENV{'http_proxy'} = '';
+
+require("$PREFIX/etc/deploy-system.conf");
+
+our $TYPE='cli';
+our $LOCK=0;
+our $HOOKS="$LIB/hooks";
+
+$SIG{CHLD} = 'IGNORE';
+${^CHILD_ERROR_NATIVE} = 1;
+
+# Make sure we have correct directories
+File::Path::make_path($DATA, $QUEUE, $BASE, $TMP, $LOGDIR) if (!-d $DATA || !-d $BASE || !-d $QUEUE || !-d $TMP || !-d $LOGDIR);
+
+$HR="----------------------------------";
+
+&setupenv();
+my $ret=0;
+if ($0 =~ /-daemon$/)
+{
+	$TYPE='daemon';
+	&daemon();
+}
+elsif ($0 =~ /-torrent-done-script$/)
+{
+	$TYPE='torrent-done-script';
+	&torrentDoneScript();	
+}
+elsif ($ACTION eq 'start')
+{
+	$ret = &start();
+}
+elsif ($ACTION eq 'stop')
+{
+	$ret = &stop();
+}
+elsif ($ACTION eq 'restart')
+{
+	$ret = &stop();
+	$ret = &start();
+}
+elsif ($ACTION eq 'add')
+{
+	&usage() if (!$OPTION);
+	&lock();
+
+	&startIfNotRunning();
+
+	if ($OPTION2 eq 'from') { $ret = &add($OPTION, $OPTION3); } 
+	else			{ $ret = &add($OPTION); }
+
+	&unlock();
+}
+elsif ($ACTION eq 'delete')
+{
+	&lock();
+
+	&startIfNotRunning();
+
+	$ret = &delete($OPTION);
+	&unlock();
+}
+elsif ($ACTION eq 'status')
+{
+	&status($OPTION);
+}
+elsif ($ACTION eq 'tstatus')
+{
+	&tstatus($OPTION);
+}
+elsif ($ACTION eq 'lock')
+{
+	$ret = &tlock($OPTION);
+}
+elsif ($ACTION eq 'unlock')
+{
+	$ret = &tunlock($OPTION);
+}
+elsif ($ACTION eq 'rebuild')
+{
+	$ret = &rebuild();
+}
+else
+{
+	&usage();
+}
+exit $ret;
+
+sub usage()
+{
+        print "Usage: $0 { start | stop | restart | add | delete | status | tstatus } [name] [from SRCDIR/] [--force] [--exclude]\n";
+	print "$HR\n";
+	print "Deploy root: $DATA\n";
+	print "$HR\n";
+	print "start     Starts deploy daemon.\n";
+	print "stop      Stops deploy daemon.\n";
+	print "restart   Restarts deploy daemon.\n";
+	print "add       Add a new torrent or recompile a new torrent.\n";
+	print "          Name needs to exist in $DATA or use from SRCDIR\n";
+	print "delete    Delete torrent from $DATA\n";
+	print "status    Shows status of deploy and all existing torrents.\n";
+	print "          Will display status for one name if name argument is supplied.\n";
+	print "tstatus   Shows status of torrents.\n";
+	print "          Will display full torrent information for one name if name argument is supplied.\n";
+	print "lock	 Place a temporary(maximum 1800 seconds) lock on torrent\n";
+	print "unlock    Unlock a previously locked torrent\n";
+	print "rebuild	 Rebuild transmission/torrent database\n";
+	print "--exclude=pattern Exclude files\n";
+	print "$HR\n";
+	print "Deployment configuration: $PREFIX/etc/deploy.conf\n";
+	print "Host details are determined by shell script hooks in $HOOKS.\n";
+	print "Trackers: $HOOKS/tracker.sh\n";
+	print "If self host is tracker, deploy will run as tracker as well.\n";
+	print "Trackers will be notified when there's a new deployment. All hosts will check on trackers to see if new deployment exists.\n"
+}
+sub failenv
+{
+	my $file = shift;
+	my $desc = shift; chomp($desc);
+	print "Unable to find $file!\n";
+	print "$desc\n" if ($desc);
+	print "Deploy requires transmission, rsync, opentracker, zip to be installed!\n";
+	print "Paths are configured in deploy-system.conf\n";
+	print "Transmission: http://www.transmissionbt.com/\n";
+	print "Rsync: http://rsync.samba.org/\n";	
+	print "Opentracker: https://erdgeist.org/arts/software/opentracker/\n";
+	print "Zip: http://www.info-zip.org/\n";
+	print "$HR\n";
+	print "Either install them on your system or compile them.\n";
+	print "If compiling you can put your packages in lib/packagename/\$ARCH/lib/bin/\n";
+	print "All src files are available in src/\n";
+	print "$HR\n";
+	exit 255;
+}
+
+sub setupenv()
+{
+	our $ACTION=$ARGV[0];
+	our $OPTION=$ARGV[1];
+	our $OPTION2=$ARGV[2];
+	our $OPTION3=$ARGV[3];
+
+	our $FORCE=0;
+	$FORCE=1 if (grep { /^--force$/ } @ARGV);
+	our @EXCLUDE=("'.deploy/*'");
+	foreach my $arg (@ARGV)
+	{
+		next if ($arg !~ /--exclude=(.*)/);
+		push(@EXCLUDE, "'$1'");
+	}
+
+	our $OS=lc(`uname -s`); chomp($OS);
+	our $HOST=lc(`uname -n`); chomp($HOST);
+
+	our $PS='ps';
+	$PS='/usr/ucb/ps' if ($OS =~ /sunos/);
+	
+	our $UNAME=`uname -n`; chomp($UNAME);
+	our ($HOSTNAME) = ($UNAME =~ /^(.*?)\./);
+	$HOSTNAME = $UNAME if (!$HOSTNAME);
+
+	our $APIFILE="$TMP/.apikey";
+
+	our $MYPIDFILE="$TMP/.deploy.pid";
+	our $MYPIDFILE_rsync = "$TMP/.rsync.deploy.pid";
+	our $MYPIDFILE_opentracker = "$TMP/.rsync.opentracker.pid";
+	our $MYPIDFILE_transmission = "$TMP/.deploy.transmission.pid";
+
+	mkdir("$PREFIX/libexec") if (! -d "$PREFIX/libexec");
+
+	# look for required programs
+        foreach my $req (keys %REQUIRED)
+        {
+		my $path;
+		foreach my $f ( @{$REQUIRED{$req}} )
+		{
+			chomp($f); # just in case
+			next if (! -x $f);
+			$path = $f;
+			last;
+		}	
+		&failenv($req, "Possible paths: ". join(', ', @{$REQUIRED{$req}})) if (!$path);
+
+		# create symlink to libexec
+		my $newpath="$PREFIX/libexec/deploy-". basename($path);
+		unlink($newpath) if (-e $newpath && $path ne readlink($newpath));
+		symlink($path, $newpath);
+		&failenv($req, "Unable to create symlink $newpath") if (! -e $newpath);
+		$$req=$newpath;
+        }
+
+	# extra arguments
+	$LIB_transmission_remote .= " 127.0.0.1 -n deploy:$API";
+
+	&logrotate();
+	&confupdate();
+}
+sub children
+{
+	my $restart = shift || 0;
+
+	if ($restart)
+	{
+		&startTracker() if (&isTracker());
+		&startTransmission();
+	}
+	else
+	{
+		# get a list of trackers and start if need be
+		if ( &isTracker() )
+		{
+			my @pids = &statusTracker();
+        		&startTracker() if ( &isTracker() && ! ( $pids[0] && $pids[1] ) );
+		}
+
+        	# start transmission or restart
+        	&startTransmission() if ( !&statusTransmission() );
+	}
+}
+
+
+sub log($$)
+{
+        my ($i, $out) = @_;
+        print "$i\n" if ($out);
+
+        open(FILE, ">>$LOGFILE");
+        print FILE scalar(localtime()) . ": $i\n";
+        close(FILE);
+}
+sub logrotate()
+{
+	# restart children if $restart is true
+	my $restart = shift || 0;
+
+	my $oldts = $TSlog;
+	our @TS =localtime(time);
+        our $TSlog=sprintf('%4d%02d%02d', $TS[5]+1900, $TS[4]+1, $TS[3]);
+
+	return if ($oldts == $TSlog);	
+	# if we are here that means its either midnight or we are starting
+
+	our $LOGFILE = $LOGDIR ."/deploy.log-$TSlog";
+        our $LOGFILE_rsync = "$LOGDIR/deploy.rsync.log-$TSlog";
+        our $LOGFILE_opentracker = "$LOGDIR/deploy.opentracker.log-$TSlog";
+        our $LOGFILE_transmission = "$LOGDIR/deploy.transmission.log-$TSlog";
+
+	my @deleted;
+	foreach my $f ( ($LOGFILE, $LOGFILE_transmission, $LOGFILE_rsync, $LOGFILE_opentracker) )
+	{
+		my ($log) = ($f =~ /(.*?)-\d+/);
+		$log = basename($log);
+		my @files;
+		foreach my $file ( <$LOGDIR/$log-*> )
+		{
+			push (@files, $file);
+		}
+		my $i;
+		foreach my $file ( sort { $b cmp $a } @files )
+		{
+			if ($i >= $LOGDAYS)
+			{
+				unlink($file);
+				push (@deleted, basename($file));
+			}
+			$i++;
+		}
+	}
+
+	my $numDeleted = $#deleted + 1;
+	&log("Deleting old log files: ". join(',', @deleted)) if ($numDeleted > 0);
+
+	if ($restart)
+	{
+		&log("Rotating log files. Restarting children.");
+		&children($restart);	
+	}
+}
+
+sub tlock
+{
+        my $data = shift;
+        my $torrent = basename($data) if ($data);
+        if (!$data || $data =~ /\./ || $data eq 'data' || !-d "$DATA/$torrent")
+        {
+                &log(" - ERROR: Invalid name!", 1);
+                return;
+        }
+        &log("DEPLOY LOCK: $torrent", 1);
+	$TYPE="command.$data";
+	&createlock();
+	return 0;
+}
+sub tunlock
+{
+        my $data = shift;
+        my $torrent = basename($data) if ($data);
+	if (!$data || $data =~ /\./ || $data eq 'data' || !-d "$DATA/$torrent")
+        {
+                &log(" - ERROR: Invalid name!", 1);
+                return;
+        }
+        &log("DEPLOY UNLOCK: $torrent", 1);
+	$TYPE="command.$data";
+	$LOCK=1;
+        &unlock();
+	return 0;
+}
+
+# lock file to make sure there's no clash betwen daemon and arguments
+# if arg is passed, it only checks if lockfile exists, useful for syncTorrents
+# command argument is when lock is invoked from command line option
+sub lock
+{
+	my $check = shift || 0;
+
+	my $timeout = 1800;
+	$timeout = 120 if ($type eq 'daemon');
+
+	my $startTS = time;
+	my ($since, $type) = &statlock();
+	while ($since)
+	{
+		my $ts = time;
+		my $left2 = $ts - $startTS;
+		return 1 if ( $TYPE =~ /^command\./ && $left2 > $timeout );
+
+		my $diff = $ts - $since;
+		my $left = $timeout - $diff; $left = 0 if ($left < 0);
+		&log("Lock file detected: $TMP/.lock, type: $type, since: ". localtime($since) .". Time left before force unlock: $left seconds.", 1);
+		if ( $diff > $timeout )
+		{
+			&log("Lock file is older than $timeout seconds, removing lock!", 1);
+			unlink("$TMP/.lock");
+			last;
+		}	
+		
+		return 1 if ($check);
+		
+		sleep 10;
+		($since, $type) = &statlock();
+	}
+
+	return 0 if ($check);
+		
+	$LOCK=1 if ($TYPE !~ /^command\./);
+
+	&createlock();
+	return 0;
+}
+sub statlock
+{
+	my $locked = 0;
+	my $since = 0;
+	if ( -f "$TMP/.lock")
+	{
+		my @s = stat("$TMP/.lock");
+		$since = $s[9];
+		open(file, "$TMP/.lock");
+			$locked =  <file>; chomp($locked);
+		close(file);
+	}
+
+	return ($since, $locked);
+}
+sub unlock
+{
+	unlink("$TMP/.lock") if ($LOCK);
+	return 0;
+}
+sub createlock
+{
+	open(file, ">$TMP/.lock");
+                print file "$TYPE\n";
+                print file localtime(time) .": $0 ". join(' ', @ARGV) ."\n";
+        close(file);
+}
+sub cleanup()
+{
+        exit;
+}
+
+# call external hook command
+sub hook($)
+{
+	my ($hook) = @_;
+
+	if ( -f "$HOOKS/$hook.sh" ) 
+	{
+		my $out = `$HOOKS/$hook.sh 2>&1`;
+		return $out;	
+	}
+	else
+	{
+		&log("ERROR! Unable to access $HOOKS/$hook.sh");
+		exit 255;
+	}
+}
+
+# gets a list of trackers, sets global @TRACKERS, returns 
+# if we are a tracker, then make sure we are running 
+sub getTrackers()
+{
+	return if (@TRACKERS);
+
+	our @TRACKERS = split("\n", &hook('tracker'));
+}
+sub isTracker()
+{
+	return $TRACKER if (defined $TRACKER);
+	&getTrackers() if ( !@TRACKERS );
+
+	if ( grep { $HOSTNAME eq $_ } @TRACKERS )
+	{
+		our $TRACKER=1;
+	}
+	else
+	{
+		our $TRACKER=0;	
+	}
+	return $TRACKER;
+}
+# validates if torrent is for us
+# returns true if to proceed
+# returns false if we should skip
+sub isTorrent($)
+{
+	my ($name) = @_;
+
+	if (exists $CONFIG->{MAIN}->{onlyInDeploy}->{true})
+	{
+		return 0 if (! exists $CONFIG->{DEPLOY}->{$name} );	
+	}
+	else
+	{
+		return 1 if (! exists $CONFIG->{DEPLOY}->{$name} );
+	}
+
+	if ( &isTracker() )
+	{
+		return 1 if (exists $CONFIG->{DEPLOY}->{$name}->{hosts}->{'$TRACKERS'});
+		return 0 if (exists $CONFIG->{DEPLOY}->{$name}->{exclude}->{'$TRACKERS'});
+	}
+
+	return 1 if ( exists $CONFIG->{DEPLOY}->{$name}->{hosts}->{$HOSTNAME} );
+	return 0 if ( exists $CONFIG->{DEPLOY}->{$name}->{exclude}->{$HOSTNAME} );
+
+	my @keys = keys %{$CONFIG->{DEPLOY}->{$name}->{hosts}};
+	return 1 if (! @keys);
+
+	return 0;
+}
+# updates $DEPLOY every hour
+sub confupdate()
+{
+        my $oldts = $TSconf;
+        our @TS =localtime(time);
+        our $TSconf=sprintf('%4d%02d%02d%02d', $TS[5]+1900, $TS[4]+1, $TS[3], $TS[4]);
+	return if ($oldts == $TSlog);
+        # if we are here that means its either beginning of hour or we are starting
+	return if (! -f "$PREFIX/etc/deploy.conf");
+
+	# parse config
+	my $cache;
+	open(file, "$PREFIX/etc/deploy.conf");
+	our $CONFIG = {};
+	foreach my $l (<file>)
+	{
+		next if ($l =~ /^#/);
+		chomp($l);
+		my ($key, $val) = split(/\s+?=\s+?/, $l);
+
+		my $c = $CONFIG;
+		foreach my $k ( split(/\./, $key) )
+		{
+			$c->{$k} = {} if (!defined $c->{$k});
+			$c = $c->{$k};
+		}
+		foreach my $v ( split(/\s+/, $val) )
+		{
+			if ($v =~ /\//)
+			{
+				my $x;
+				if ($v =~ /^\//) { $x = $v; }
+				elsif ($v =~ /^hooks\/(.*)/) { $x = "$HOOKS/$1"; }
+				next if (! -x $x);
+				if (! exists $cache->{$v})
+				{
+					@{$cache->{$v}} = split("\n", `$x`);
+				}
+				foreach my $host ( @{$cache->{$v}} )
+				{
+					$c->{$host} = 1;
+				}
+			}
+			else
+			{
+				$c->{$v} = 1;
+			}
+		}
+	}
+	close(file);
+}
+# starts tracker or restarts if not running
+sub startTracker()
+{
+	sleep(2) if (&stopTracker());
+
+	# RSYNC
+	&log("Starting tracker - rsync");
+        	# generate apikey file
+        	open(file, ">$APIFILE");
+                	print file $API;
+        	close(file);
+        	chmod 0600, $APIFILE;
+
+
+		unless (my $pid = fork())
+		{
+			my $dir = dirname(dirname($LIB_rsync));
+			chdir($dir);
+
+			# generate rsyncd.conf
+                        my $file;
+			my $f=0;
+                        open(file, "$PREFIX/etc/rsyncd.conf");
+			foreach my $line (<file>)
+			{
+				$line = "secrets file = $APIFILE.rsyncd\n" if ($line =~ /^secrets file/);
+				$line = "pid file = $MYPIDFILE_rsync\n" if ($line =~ /^pid file/);
+				$line = "log file = $LOGFILE_rsync\n" if ($line =~ /^log file/);
+
+				$f = 1 if ($line =~ /^[DEPLOY]/);
+				$line = "path = $QUEUE\n" if ($line =~ /^path =/ && $f);
+				$file .= $line;
+			}
+			close(file);
+			open(file, ">$TMP/.rsyncd.conf");
+			print file $file;
+			close(file);
+
+			# Generate rsyncd apikey
+			open(file, ">$APIFILE.rsyncd");
+				print file "deploy:$API\n";
+			chmod 0600, "$APIFILE.rsyncd";
+			close(file);
+
+			unlink($MYPIDFILE_rsync) if ( -f $MYPIDFILE_rsync);
+			$DAEMON_rsync = Proc::Daemon->new(
+				work_dir => $dir,
+				exec_command => "$LIB_rsync --config=$TMP/.rsyncd.conf --daemon --port=$PORT_rsync"
+			);
+			$DAEMON_rsync->Init();
+			if ($DAEMON_rsync->Status())
+			{
+				&log("ERROR! Unable to start rsync process.");
+			}
+			else
+			{
+				&log("Rsync process started.");
+			}
+			exit;
+		}
+
+	# OPENTRACKER
+	&log("Starting tracker - opentracker");
+
+		unless (my $pid = fork())
+		{
+			my $dir = dirname(dirname($LIB_opentracker));
+			chdir($dir);
+			unlink($MYPIDFILE_opentracker) if ( -f $MYPIDFILE_opentracker);
+			$DAEMON_opentracker = Proc::Daemon->new(
+				work_dir => $dir,
+                        	child_STDOUT => "+>>$LOGFILE_opentracker",
+                        	child_STDERR => "+>>$LOGFILE_opentracker",
+                        	pid_file => "$MYPIDFILE_opentracker",
+                        	exec_command => "$LIB_opentracker -f $PREFIX/etc/opentracker.conf -p $PORT_opentracker"
+			);
+			$DAEMON_opentracker->Init();
+			if ($DAEMON_opentracker->Status())
+			{
+				&log("ERROR! Unable to start opentracker process.");	
+			}
+			else
+			{
+				&log("Opentracker process started.");
+			}
+			exit;	
+		}
+}
+sub stopTracker()
+{
+	my @pids = &statusTracker();
+
+	my $status = 0;
+
+	if (@pids)
+	{
+		$status=1;
+
+		&log(" - Stopping rsync...");
+		foreach my $p ( split(',', $pids[0]) )
+		{
+			&log(" - Stopping rsync: $p");
+			&sendpid($p);
+		}
+			
+		&log(" - Stopping opentracker...");
+		foreach my $p ( split(',', $pids[1]) )
+		{
+			&log(" - Stopping opentracker: $p");
+			&sendpid($p);
+		}
+	}
+	return $status;
+}
+sub statusTracker()
+{
+	my @pids = ();
+	push(@pids, join(',', &checkProcess("deploy-rsync")));
+	push(@pids, join(',', &checkProcess("deploy-opentracker")));
+	return @pids;
+}
+# update trackers of new changes
+# returns number of trackers that it updated, if it returns 0 that means it failed to update
+sub updateTrackers($)
+{
+        my ($ts) = @_;
+
+ 	# delete any older versions
+        &cleanupOlderVersions();
+
+	my $ret = 0;
+	&getTrackers();
+        &log("Updating trackers: ". join(',', @TRACKERS) ." with version id: $ts", 1);
+	&log("$QUEUE/.retry_tracker");
+
+	unlink("$QUEUE/.retry_tracker") if (-f "$QUEUE/.retry_tracker");
+        foreach my $tracker (@TRACKERS)
+        {
+		if ($HOSTNAME eq $tracker)
+		{
+			$ret++;
+			next;
+		}
+
+		# update everything except version, we want to transfer version as last file, also only update newer
+		# if fails to update, leave a marker to retry later
+		my $fail=0;
+        	my $out = `USER=deploy $LIB_rsync --contimeout=2 --timeout=2 -au -iO --delete --port $PORT_rsync --include='/*.torrent' --exclude='*' --password-file=$APIFILE $QUEUE/ ${tracker}::DEPLOY/ 2>&1`;
+                if ($? > 0)
+                {
+                        &log(" - WARNING: failed to update tracker: $tracker", 1);
+			$fail=1;
+                }
+		else
+		{
+			my $out = `USER=deploy $LIB_rsync --contimeout=2 --timeout=2 -au -iO --delete --port $PORT_rsync --password-file=$APIFILE $QUEUE/.version ${tracker}::DEPLOY/ 2>&1`;
+			if ($? > 0)
+			{
+				&log(" - ERROR: failed to update tracker: $tracker with version file", 1);
+				$fail=1;
+			}
+			else
+			{
+				$ret++;
+			}
+		}
+		if ($fail)
+		{
+			open(f, ">>$QUEUE/.retry_tracker");
+			print f "$tracker : $ts\n";	
+			close(f);
+		}
+	}
+	return($ret);
+}
+sub retryTrackers()
+{
+	return if (! -f "$QUEUE/.retry_tracker");
+	
+	&log("Tracker retry lock found. Retrying to update update Trackers.");
+	my ($qversion, $dversion) = &getVersion();
+	&updateTrackers($qversion);
+}
+
+# starts transmission process or restarts if not running
+sub startTransmission()
+{
+	sleep(2) if ( &stopTransmission() );
+
+	# TRANSMISSION
+		&log("Starting torrent client - transmission");
+        	# generate apikey file
+        	open(file, ">$APIFILE");
+                	print file $API;
+        	close(file);
+        	chmod 0600, $APIFILE;
+
+		unless (my $pid = fork())
+		{
+			my $dir = dirname(dirname($LIB_transmission));
+			chdir($dir);
+
+			# generate settings.json
+			my $file;
+                        open(file, "$PREFIX/etc/transmission.conf");
+			foreach my $line (<file>)
+			{
+				$line = "\"rpc-password\": \"$API\",\n" if ($line =~ /"rpc-password":/);
+				$line = "\"script-torrent-done-filename\": \"$HOOKS/deploy-torrent-done-script\",\n" if ($line =~ /"script-torrent-done-filename":/);
+				$file .= $line;
+			}
+			close(file);
+
+			File::Path::make_path("$TMP/.transmission") if ( ! -d "$TMP/.transmission" );		
+			open(file, ">$TMP/.transmission/settings.json");
+			print file $file;
+			close(file);
+
+			unlink($MYPIDFILE_transmission) if ( -f $MYPIDFILE_transmission);
+
+			my $cmd = "$LIB_transmission --config-dir $TMP/.transmission --no-watch-dir --no-incomplete-dir --no-portmap --no-lpd --no-dht -P $PORT_transmission --download-dir $BASE -t -u deploy --rpc-bind-address 127.0.0.1 --pid-file $MYPIDFILE_transmission --logfile=$LOGFILE_transmission";
+			#&log($cmd);
+                	our $DAEMON_transmission = Proc::Daemon->new(
+                        	work_dir => $dir,
+				exec_command => $cmd
+                	);
+			$DAEMON_transmission->Init;
+                	if ($DAEMON_transmission->Status())
+                	{
+                        	&log("ERROR! Unable to start Transmission process: $LIB_transmission $LIB_transmission_options");
+                	}
+                	else
+                	{
+                        	&log("Transmission process started.");
+                	}
+			exit;
+		}
+}
+
+sub stopTransmission()
+{
+	my @pids = &checkProcess("deploy-transmission-daemon");
+
+	my $status=0;
+	if (@pids)
+	{
+		$status=1;
+		&log(" - Stopping transmission...");
+		foreach my $pid ( @pids )
+		{
+			&log(" - Stopping transmission: $pid");
+        		&sendpid($pid) if ($pid);
+		}
+	}
+	return $status;
+}
+sub statusTransmission()
+{
+	my @pids = &checkProcess("deploy-transmission-daemon");
+
+	if (@pids)
+	{
+        	$content = &clientTransmission({  method => "session-get" });
+        	if (exists $content->{'result'} && $content->{'result'} eq 'success')
+		{
+			return @pids;
+		}
+	}
+	return 0;
+}
+# returns transmission client output
+# https://trac.transmissionbt.com/browser/trunk/extras/rpc-spec.txt
+sub clientTransmission
+{
+	my $request = shift || '';
+
+	my $host = '127.0.0.1:9091';
+	my $url = "http://$host/transmission/rpc";
+
+	our $TRANSMISSION = &clientTransmissionLogin($host,$url) if (! $TRANSMISSION);
+	
+	return if (!$request || !$TRANSMISSION);
+
+	my $res = $TRANSMISSION->call($url, $request);	
+	if (!$res || ($res && $res->is_error))
+	{
+		# relog & retry
+		$TRANSMISSION = &clientTransmissionLogin($host, $url);
+		$res = $TRANSMISSION->call($url, $request);
+		if ($res && $res->is_error)
+		{
+			&log(" - ERROR: sending request to transmission: ". $res->message());
+			return;
+		}
+	}
+	return $res->content if ($res && !$res->is_error);
+}
+sub clientTransmissionLogin($$)
+{
+	my ($host, $url) = @_;
+	
+	my $trans = new JSON::RPC::Client;
+        $trans->ua->credentials($host, 'Transmission', 'deploy', $API);
+        my $res = $trans->ua->get($url);
+        if (!$res)
+        {
+                &log(" - ERROR: Unable to login to transmission daemon!", 1);
+                return;
+        }
+        my ($sessionID) = ($res->content =~ /X-Transmission-Session-Id: (.*?)</);
+        $trans->ua->default_header('X-Transmission-Session-Id' => $sessionID);
+	return $trans;
+}
+
+# removes old versions of torrents
+sub cleanupOlderVersions()
+{
+	my %torrents = {};
+	my @dtorrents = ();
+	foreach my $f (<$QUEUE/*.torrent>)
+	{
+		my $f = basename($f);	
+		next if ($f !~ /(.*?)\.(\d+)\.torrent/);
+		my ($t, $v) = ($1, $2);
+
+		if (exists $torrents{$t})
+		{
+			if ($v < $torrents{$t})
+			{
+				push(@dtorrents, "$t.$v");	
+			}
+			elsif ($v > $torrents{$t})
+			{
+				push(@dtorrents, "$t.". $torrents{$t});
+			}
+		}
+		else
+		{
+			$torrents{$t} = $v;	
+			next;
+		}
+		
+	}	
+
+	foreach my $f (<$BASE/*.*>)
+	{
+		my $f = basename($f);
+		next if ($f !~ /(.*?)\.(\d+)/);
+		my ($t, $v) = ($1, $2);	
+
+		if (exists $torrents{$t})
+                {
+                        if ($v < $torrents{$t})
+                        {
+                                push(@dtorrents, "$t.$v");
+                        }
+			elsif ($v > $torrents{$t})
+			{
+				push(@dtorrents, "$t.". $torrents{$t});
+			}
+                }
+                else
+                {
+                        $torrents{$t} = $v;     
+                        next;
+                }
+	}
+
+	my %hash;
+	foreach my $d ( @dtorrents ) { $hash{$d} = 1; }
+	foreach my $f ( keys %hash )
+	{
+		next if ($f !~ /(.*?)\.(\d+)/);
+		&delTorrent($1, $2);
+	}
+}
+
+# input is location in $BASE
+# add from command line is same as create
+sub add
+{
+	my $data = shift;
+	my $from = shift || 0;
+
+	if (!$data || $data =~ /\./ || $data eq 'data')
+        {
+                &log(" - ERROR: Invalid name!", 1);
+                return 1;
+        }
+	my $torrent = basename($data);
+	$from = "$DATA/$torrent" if (!$from);
+
+	&log("DEPLOYING: $torrent for '$DATA/$torrent' from $from", 1);
+
+	if (!-d $from)
+	{
+		&log(" - ERROR: Unable to create $data torrent because $from directory does not exist!", 1);
+		return 1;
+	}
+
+	# check to make sure we are not in a middle of a transfer, if we are error out unless we are using --force
+	my @active = &getActive();
+	if (@active)
+	{
+		if ($FORCE)
+		{
+			&log(" - WARNING: Active deployments in progress.  --force option used. Active: ". join(',', @active), 1);
+		}
+		else
+		{
+			&log(" - ERROR: Active deployments in progress. Use --force to override. Active: ". join(',', @active), 1);
+			return 1;
+		}
+	}
+
+	my $version = &makeVersion();
+	&log("Creating version id: $version", 1);
+
+	# create archive
+	if (&compress($from, $torrent, $version))
+	{
+		&log("DEPLOY FAILED: $torrent", 1);	
+		return 1;
+	}
+
+        &getTrackers();
+        # generate tracker string
+        my $trackerString;
+        foreach my $tracker (@TRACKERS)
+        {
+                $trackerString .= "--tracker http://$tracker:$PORT_opentracker/announce ";
+        }
+        if (!$trackerString)
+        {
+                &log(" - ERROR: Unable to create $torrent because tracker list is empty. Option 'status' will list all available trackers for this host.", 1);
+                return 1;
+        }
+	#create torrent
+	&log("Creating torrent: $torrent");
+	#print "$LIB_transmission_create --outfile $QUEUE/$torrent.$version.torrent --comment 'host:$HOST version:$version name:$torrent' $trackerString $BASE/$torrent.$version\n";
+	system("$LIB_transmission_create --outfile $QUEUE/$torrent.$version.torrent --comment 'host:$HOST version:$version name:$torrent' $trackerString $BASE/$torrent.$version");
+	if ($? > 0)
+	{
+		File::Path::rmtree("$BASE/$torrent.$version", "$QUEUE/$torrent.$version.torrent") if ($torrent && $version);
+		&log(" - ERROR: Unable to create $torrent for '$DATA/$torrent'", 1);
+		&log("DEPLOY FAILED: $torrent", 1);
+		return 1;
+	}
+
+	# add to transmission   
+        my $ret = &addTorrent($torrent, $version);
+       	if ($ret == 0)
+       	{
+               	# create version on main
+               	&updateVersion(0, $version);
+		
+		my $count = &updateTrackers($version);
+		&log(" - WARNING: Unable to update trackers, will retry later.", 1) if (!$count);
+       	}
+       	else
+       	{
+		File::Path::rmtree("$BASE/$torrent.$version", "$QUEUE/$torrent.$version.torrent") if ($torrent && $version);
+               	&log(" - ERROR: Unable to add torrent to client.  Check logfile $LOGFILE_transmission.", 1);
+		&log("DEPLOY FAILED: $torrent", 1);
+		return 1;
+       	}
+
+        &log("DEPLOYED: $torrent", 1);
+	return 0;
+}
+sub delete($)
+{
+	my ($data) = @_;
+	my $ret = 0;
+	
+	if (!$data)
+	{
+		print "ERROR: Invalid option!\n";
+		return 3;
+	}
+        if ($data =~ /\./ || $data eq 'data')
+        {
+                &log(" - ERROR: Invalid name!", 1);
+                return 1;
+        }
+
+	my $torrent = basename($data);
+	&log("DEPLOYING delete: $torrent for '$DATA/$torrent'", 1);
+
+        # check to make sure we are not in a middle of a transfer, if we are error out unless we are using --force
+        my @active = &getActive();
+        if (@active)
+        {
+                if ($FORCE)
+                {
+                        &log(" - WARNING: Active deployments in progress.  --force option used. Active: ". join(',', @active), 1);
+                }
+                else
+                {
+                        &log(" - ERROR: Active deployments in progress. Use --force to override. Active: ". join(',', @active), 1);
+                        return 1;
+                }
+        }
+
+	&delTorrent($torrent);
+
+        # delete data
+        if (-d "$DATA/$torrent")
+        {
+                &log(" - Deleting '$DATA/$torrent'", 1);
+                File::Path::rmtree("$DATA/$torrent") if ($torrent);
+                if (-d "$DATA/$torrent")
+                {
+                        &log(" - WARNING: Unable to delete $DATA/$torrent", 1);
+                }
+        }
+
+	if ($TYPE eq 'cli' && $ret == 0)
+        {
+		my $version = &makeVersion();
+                &log("Creating version: $version", 1);
+                # create version on main
+                &updateVersion('', $version);
+
+                # notify trackers
+                my $count = &updateTrackers($version);
+		&log(" - WARNING: Unable to update trackers, will retry later.", 1) if (!$count);
+        }
+        else
+        {
+		&log(" - ERROR: Unable to delete torrent from client. Check logfile $LOGFILE_transmission.", 1);
+		return 1;
+	}
+	&log("DEPLOYED delete: $torrent", 1);
+}
+
+sub makeVersion()
+{
+	my @t = localtime(time);
+	return sprintf('%4d%02d%02d%02d%02d%02d', $t[5]+1900, $t[4]+1, $t[3], $t[2], $t[1], $t[0]);
+}
+sub updateVersion()
+{
+	my $torrent = shift || 0;
+	my $ts = shift || 0;
+
+	# update main version if arg is empty
+	if (!$torrent)
+	{
+		if ($ts)
+		{
+			open(file, ">$QUEUE/.version");
+			print file "$ts\n";
+			close(file);
+		}
+		mkdir "$DATA/.deploy" if (!-d "$DATA/.deploy");
+		copy("$QUEUE/.version", "$DATA/.deploy/version");
+	}
+	elsif (-d "$DATA/$torrent")
+	{
+		# otherwise update specific torrent info
+		File::Path::make_path("$DATA/$torrent/.deploy") if (! -d "$DATA/$torrent/.deploy");
+
+		open(file, ">$DATA/$torrent/.deploy/version");
+			print file "$ts\n";
+		close(file);
+	}
+}
+
+# update transfer status of each torrent
+sub updateStatus
+{
+	my $name = shift || '';
+	my $status = shift || '';
+
+	return if (!$name);
+
+	if ($status)
+	{
+		my $state = "$DATA/$name/.deploy/state";
+		mkdir "$DATA/$name/.deploy" if (! -d "$DATA/$name/.deploy");	
+		open(f, ">$state");
+			print f "$status\n";
+		close(f);
+		return;
+	}
+}
+sub getActive
+{
+	my @active;
+	my %torrents = &getTorrents('', 'transmission');
+	foreach my $torrent ( keys %torrents )
+	{
+		next if ($torrent !~ /(.*?)\.(\d+)/);
+	
+		push(@active, $1 .'.'. $torrents{$torrent}{'lversion'} ."->$2") if ($torrents{$torrent}{'version'} != $torrents{$torrent}{'lversion'});
+	}
+	return @active;
+}
+sub getStatus
+{
+	my $name = shift;
+	
+	my $status;
+	my $state = "$DATA/$name/.deploy/state";
+
+	if ( -f $state)
+	{
+		open(f, $state);
+		$status = <f>; chomp($status);
+		close(f);
+	}
+	return $status;
+}
+
+sub getVersion()
+{
+	my $torrent = shift || 0;
+	my $queued = shift || 0;
+	if (!$torrent)
+	{
+		my @ts = (0,0);
+		my $i;
+		if (-f "$QUEUE/.version")
+		{
+			open(file, "$QUEUE/.version");
+				$i = <file>; chomp($i);
+				$i = 0 if (!$i);
+				$ts[0] = $i;
+                	close(file);
+		}
+		if (-f "$DATA/.deploy/version")
+		{
+			open(file, "$DATA/.deploy/version");
+				$i = <file>; chomp($i);
+				$i = 0 if (!$i);
+				$ts[1] = $i;
+                	close(file);
+		}
+		return @ts;
+	}
+	else
+	{
+		if ($queued)
+		{
+			my $torrentInfo = &getTorrents($torrent);
+			return $torrentInfo->{'version'} if (exists $torrentInfo->{'version'});
+		}
+		elsif (-f "$DATA/$torrent/.deploy/version")
+		{
+			open(file, "$DATA/$torrent/.deploy/version");
+			my $ts = <file>; chomp($ts);
+			$ts = 0 if (!$ts);
+                	close(file);
+			return $ts;
+		}
+        }
+	return 0;
+}
+
+# actually adds to transmission via remote
+# version arg is required
+sub addTorrent($$)
+{
+	my ($torrent, $version) = @_;	
+	my $ret=0;
+
+        if ($torrent =~ /\./ || $torrent eq 'data')
+        {
+                &log(" - ERROR: Invalid name!", 1);
+                return;
+        }
+
+	&log("Adding torrent: $torrent [$version]", 1);
+
+	# check if we are allowed to work with thit torrent on this host
+        if (! &isTorrent($torrent))
+	{
+		&log(" - ERROR: Host $HOSTNAME is not allowed to work with '$torrent'", 1);
+		return 3;
+	}
+
+	&getTrackers();
+
+	# we make directory here to reserve a name
+	File::Path::make_path("$DATA/$torrent/.deploy") if (!-d "$DATA/$torrent/.deploy");
+        File::Path::make_path("$BASE/$torrent.$version") if (!-d "$BASE/$torrent.$version");
+	&updateVersion($torrent, 0) if (!-f "$DATA/$torrent/.deploy/version");
+
+	# check if its already there, delete any older versions, if same version then reannounce
+	my @olderVersions;
+	my %torrents = &getTorrents('', 'transmission');
+	foreach my $i (keys %torrents)
+	{
+		next if ($i !~ /(.*?)\.(\d+)/);	
+		my $t = $1;
+		my $v = $2;
+		my $id = $torrents{$i}{'id'};
+
+		next if ($torrent ne $t);
+
+		my $remove = 'remove-and-delete';
+		if ($version == $v)
+		{
+			&log("- torrent: $torrent [$version] already exists with same version, reannouncing and updating trackers.");
+			$remove = 'remove';
+		}
+		elsif ($version < $v)
+		{
+			&log("- WARNING: torrent: $torrent [$version] already exists with newer version: $v, not adding older torrent.");
+			return 3;
+		}
+		else
+		{
+			&log("- torrent: $torrent [$version] already exists with older version: $v, reannouncing and updating trackers.");
+		}
+		
+		my $out = `$LIB_transmission_remote --torrent $id --$remove 2>&1`;			
+		if ($? > 0)
+                {
+                	&log(" - ERROR encountered while updating already existing torrent: $torrent, id: $id", 1);
+                        print "$HR\n";
+                        print $out;
+                        return 3;
+		}
+		# delete torrent file before transmission cmd
+                unlink("$QUEUE/$t.$v.torrent") if ($remove eq 'remove-and-delete' && -f "$QUEUE/$t.$v.torrent");
+
+		# sleep here for 2 seconds to give transmission time to process, for safety
+		sleep 5;
+	}
+
+	my $out = `$LIB_transmission_remote --add $QUEUE/$torrent.$version.torrent 2>&1`; # --torrent-done-script $HOOKS/deploy-torrent-done-script 2>&1`;
+	if ($? > 0)
+	{
+		&log(" - ERROR encountered while adding $QUEUE/$torrent.$version.torrent", 1);
+		print "$HR\n";
+		print $out;
+		return 3;
+	}
+	# sleep ehere for 2 seconds to give transmission time to process
+	sleep 5;
+	&setTorrentTrackers($torrent);
+
+	&log("Added torrent: $torrent [$version]", 1);
+
+	&updateStatus($torrent, "$version:transferring 0%");
+			
+	return $ret;
+}
+# without version argument, it will go ahead and delete all of the torrents with same name
+sub delTorrent
+{
+	my $torrent = shift;
+	my $version = shift;
+	my $ret=0;
+
+        if ($torrent =~ /\./ || $torrent eq 'data')
+        {
+                &log(" - ERROR: Invalid name!", 1);
+                return;
+        }
+
+	&log(sprintf("Deleting torrent: $torrent %s", ($version?"[$version]":'')), 1);
+
+	return if (!$torrent);
+
+	my %torrents = &getTorrents();
+	my $found=0;
+	foreach my $i (keys %torrents)
+	{
+		next if ($i !~ /(.*?)\.(\d+)/);
+		my $t = $1;
+		my $v = $2;
+		my $id = $torrents{$i}{'id'};
+
+		next if ($torrent ne $t);
+		next if ($version && $version != $v);
+
+		$version = $v if (!$version);
+               	&log(" - deleting torrent: $t [$v] from client with id: $id", 1);
+
+                my $out = `$LIB_transmission_remote --torrent $id --remove-and-delete`;
+		if ($? > 0)
+		{
+			&log(" - ERROR encountered while trying to delete torrent: $t [$v], id: $id", 1);
+			print "$HR\n";
+			print $out;
+			return 3;
+		}
+		unlink("$QUEUE/$t.$v.torrent") if (-f "$QUEUE/$t.$v.torrent");
+		File::Path::rmtree("$BASE/$t.$v") if (-d "$BASE/$t.$v" && $t && $v);
+
+		$found++;
+	}	
+
+	# forcibly remove files even if not found in transmission loop above
+	if ($version =~ /\d+/)
+	{
+		if (-f "$QUEUE/$torrent.$version.torrent")
+		{
+			unlink("$QUEUE/$torrent.$version.torrent");
+			$found=1;
+		}
+		if (-d "$BASE/$torrent.$version")
+		{
+        		File::Path::rmtree("$BASE/$torrent.$version") if ($torrent && $version);
+			$found=1;
+		}
+	}
+
+	if (!$found)
+        {
+                &log(" - WARNING: Unable to find torrent: $torrent [$version] in client.", 1);
+                return 3;
+        }
+	
+	&log("Deleted torrent: $torrent [$version]", 1);
+
+	return $ret;
+}
+# sync data directory from queue
+# if empty, then sync whole directory
+sub syncTorrents()
+{
+	my $sync=0;
+	my $syncVersion=0;
+	my (%qtorrents, %dtorrents);
+
+	if (&lock(1)) 
+	{
+		&log("Lockfile detected, not running torrent sync.");	
+		return;
+	}
+
+	# verify data against queue and also build up quelist and datalist
+        foreach my $f ( <$DATA/*> )
+        {
+		if (-d $f)
+		{
+			my $name = basename($f);
+			next if (!$name || $name =~ /\./ || $name eq 'data');
+
+			if (-f "$f/.deploy/version")
+			{
+               			$dtorrents{$name} = 1;
+			}
+		}
+        }
+
+        # if change is already done locally by comparing .version between queue and data, then process
+	if ($sync == 0)
+	{
+        	my ($qversion, $dversion) = &getVersion();
+        	if ($qversion > $dversion)
+        	{
+        		&log("New queue version detected: $qversion on disk. Our deploy version: $dversion. Changed torrents: UNKNOWN.");
+			$sync='version';
+			$syncVersion=1;
+			&lock() if ($LOCK);
+        	}
+	}
+
+        # pulling for trackers
+	if ($sync == 0)
+	{
+	   my @newtorrents;
+	   my @errors;
+           foreach my $tracker (@TRACKERS)
+           {
+                next if ($HOSTNAME eq $tracker);
+
+                # check .version via dry-run to see if theirs is newer than ours
+		#&log("USER=deploy $LIB_rsync --contimeout=2 --timeout=2 -a -iO --update --delete --dry-run --port $PORT_rsync --password-file=$APIFILE ${tracker}::DEPLOY/.version $QUEUE/ 2>&1");
+                my $out = `USER=deploy $LIB_rsync --contimeout=2 --timeout=2 -a -iO --update --delete --dry-run --port $PORT_rsync --password-file=$APIFILE ${tracker}::DEPLOY/.version $QUEUE/ 2>&1`;
+		my $ret = $?;
+                if ($ret > 0)
+                {
+			push(@errors, "$tracker:$ret");
+                        next;
+                }
+
+                # do the actual sync if $out has lines
+                next if ($out !~ /\.version/);
+
+		$sync='rsync';
+                &lock() if (!$LOCK);
+
+		#&log("USER=deploy $LIB_rsync --contimeout=2 --timeout=2 -a -iO --delete --port $PORT_rsync --password-file=$APIFILE --include='/.version' --include='/*.torrent' --exclude='*' ${tracker}::DEPLOY/ $QUEUE/ 2>&1");
+                $out = `USER=deploy $LIB_rsync --contimeout=2 --timeout=2 -a -iO --delete --port $PORT_rsync --password-file=$APIFILE --include='/.version' --include='/*.torrent' --exclude='*' ${tracker}::DEPLOY/ $QUEUE/ 2>&1`;
+		my $ret = $?;
+                if ($ret > 0)
+                {
+                        &log("ERROR: unable to sync queue from tracker: $tracker:$ret\n");
+                }
+
+                foreach my $line ( split("\n", $out) )
+                {
+			if ($line =~ /\s(.*?\.\d+)\.torrent/)
+			{
+                        	push (@newtorrents, $1);
+			}
+                }
+
+                # read version number
+                my ($qversion, $dversion) = &getVersion();
+                &log("New queue version detected: $qversion from $tracker. Our deploy version: $dversion. Changed torrents: ". (@newtorrents?join(',', @newtorrents):'UNKNOWN') );
+
+                # No reason to go to next tracker since most of the time we already got the latest version
+		last;
+           }
+
+	   &log("ERROR: unable to check queue version from tracker:". join(',', @errors)) if (@errors);	
+	}
+
+	my @torrents;
+
+	# dont bother transmission every 15 seconds, be nice and just be a 1 in 5 chance
+	my $typeGetTorrents='queue';
+	$typeGetTorrents = '' if ( int(rand(5)) == 0 );
+	$typeGetTorrents = '';
+	my %ttorrents = &getTorrents('', $typeGetTorrents);
+	#print Dumper %ttorrents;
+
+	foreach my $f ( <$QUEUE/*.torrent> )
+        {      
+                my $name = basename($f);
+                next if ($name !~ /(.*?)\.(\d+)\.torrent$/);
+                my ($name, $version) = ($1, $2);
+
+                #verify if queue exists, if not then queued it up
+		if (&isTorrent($name))
+		{
+			$syncVersion=1;
+                	if (!exists $dtorrents{$name} || !exists $ttorrents{"$name.$version"})
+                	{
+                        	&log("Missing '$name' detected.  Redeploying.") if (!exists $dtorrents{$name});
+                        	if (!exists $ttorrents{"$name.$version"})
+                        	{
+					#&log("dumper: ". Dumper $ttorrents);
+                                	my $cversion = $ttorrents{$name}{'version'} || 'UNKNOWN';
+                                	&log("New '$name' detected with version $version. Our version: $cversion");
+                        	}
+                        	$sync=1 if (!$sync);
+                        	&lock() if (!$LOCK);
+                        	push(@torrents, "$name.$version");
+                	}
+		}
+		elsif ($sync eq 'rsync')
+		{
+			&log("Not adding '$name'. $HOSTNAME did not match deployment configuration.");
+		}
+
+                $qtorrents{"$name.$version"} = 1 if ($name && $version);
+        }
+	foreach my $t ( keys %ttorrents )
+	{
+		next if ($t !~ /(.*?)\.(\d+)/);
+		my ($t, $v) = ($1, $2);
+		if (!exists $qtorrents{"$t.$v"})
+		{
+			&log("Expired $t [$v] detected. Deleting.");
+			push(@torrents, "$t.$v");	
+			$sync=1 if (!$sync);
+			&lock() if (!$LOCK);
+		}
+	} 
+
+	if ($syncVersion && !$sync)
+	{
+		&updateVersion();
+		return;
+	}
+
+	# if nothing new needs to be done then just return
+	return if (!$sync);
+
+	my $numTorrents = $#torrents + 1;
+	my $desc = (($numTorrents > 0)?join(',', @torrents):'ALL');
+	&log("START Syncing torrents: $desc from queue to data.");
+
+	# if arg is empty, then process all torrents
+	if ($numTorrents < 1)
+	{
+		my %t;
+		map { $t{$_} = 1 if ($_ =~ /^.*?\.\d+$/) } keys %ttorrents;
+		map { $t{$_} = 1 } keys %qtorrents;
+		@torrents = keys %t;
+	}
+
+	# process torrent queue
+	my %processed;
+	foreach my $torrent ( @torrents )
+	{
+		next if ($torrent !~ /(.*?)\.(\d+)/);
+		my ($t, $v) = ($1, $2);
+		next if (!$t || !$v);
+
+		if (exists $qtorrents{"$t.$v"})
+		{
+			# update torrent
+			&addTorrent($t, $v) if (&isTorrent($t));
+			$processed{$t} = 1; # use processed to keep track since addTorrent deletes previous versions and there's no reason to run another delTorrent below
+		}
+		elsif (! exists $processed{$t})
+		{
+			# delete torrent
+			&delTorrent($t, $v);			
+		}
+	}
+
+	# cleanup data directory
+        foreach my $name ( keys %dtorrents )
+        {
+		next if (!$name);
+		if (-d "$DATA/$name")
+		{
+			if (! grep /^$name\./, keys %qtorrents)
+                	{
+                		&log(" - Deleting '$DATA/$name'", 1);
+                		File::Path::rmtree("$DATA/$name") if ($name);
+                		if (-d "$DATA/$name")
+                		{
+                        		&log(" - WARNING: Unable to delete $DATA/$name", 1);
+                		}
+        		}
+                }
+        }
+
+	# cleanup base directory
+	# normally we should not be in this loop but just in case something went amiss
+        foreach my $f ( <$BASE/*> )
+        {
+                if (-d $f)
+                {
+                        my $name = basename($f);
+                        next if ($name !~ /(.*?)\.(\d+)/);
+                        my ($t, $v) = ($1, $2);
+                        next if (!$t || !$v);
+
+                        if (!exists $qtorrents{"$t.$v"})
+                        {
+                                &log(" - Found stale base archive: $t.$v, deleting");
+                                File::Path::rmtree("$BASE/$t.$v") if ($t && $v);
+                                if (-d "$BASE/$t.$v")
+                                {
+                                        &log(" - WARNING: Unable to delete $BASE/$t.$v", 1);
+                                }
+                        }
+                }
+        }
+
+	# sync version from queue to main
+	&updateVersion()
+
+	&unlock();
+
+	&log("DONE Syncing torrents $desc from queue to data.");
+}
+# looks up torrent information from file
+sub lookupTorrentFile($)
+{
+	my ($name, $option) = @_;
+
+	my $out = `$LIB_transmission_show $QUEUE/$name.torrent`;
+	if ($? > 0)
+	{
+		&log(" - ERROR: $out", 1);
+		return;
+	}
+	return $out if ($option eq 'raw');
+
+	my %torrent;
+	my $torrentName;
+	my $torrentFile;
+	my $category;
+        foreach my $line ( split("\n", $out) )
+        {
+		if ($line =~ /^Name: (.*)/)
+		{
+			$torrentName = $1;	
+		}
+		elsif ($line =~ /^File: (.*)/)
+		{
+			$torrentFile = $1;	
+		}
+		elsif($torrentName && $torrentFile)
+		{
+			if ($line =~ /^([A-Z]+)$/)
+			{
+				$category = lc($1);
+			}
+			else
+			{
+				next if ($line !~ /\S+/);
+
+				if ($category eq 'general')
+				{	
+					$torrent{$category}{lc($1)} = $2 if ($line =~ /^\s+(.*?): (.*)/);
+				}
+				elsif ($category eq 'trackers')
+				{
+					push(@{$torrent{$category}}, $1) if ($line =~ /^\s+(.*)/);
+				}
+				elsif ($category eq 'files')
+				{
+					push(@{$torrent{$category}}, $1) if ($line =~ /^\s+(.*?)\s\(\d/);	
+				}
+			}
+		}
+        }
+	return %torrent;
+}
+sub getTorrentTrackers($$)
+{
+	my ($name, $option) = @_;
+	
+	my $id;
+	if ($name =~ /^\d+$/)
+	{
+		$id = $name;	
+	}
+	else
+	{
+		my $torrentInfo = &getTorrents($name);
+		return if (!exists $torrentInfo->{'id'});
+		$id = $torrentInfo->{'id'};
+	}	
+	my $out = `$LIB_transmission_remote --torrent $id -it 2>&1`;
+	if ($? > 0)
+        {
+                &log(" - ERROR: Unable to get tracker information for torrent: $name, id: $id", 1) if ($option eq 'raw');
+                return;
+        }
+	return $out if ($option eq 'raw');
+	
+	my $found=0;
+	my %torrent;
+	my $i;
+	foreach my $line ( split("\n", $out) )
+	{
+		next if ($line !~ /\S+/);
+		if ($line =~ /^\s+Tracker (\d+): (.*)/)
+		{
+			$i=$1;
+			$torrent{$i}{'tracker'} = $2;
+			$found=1;
+		}
+		push(@{$torrent{$i}{'log'}}, $line) if ($found);
+	}	
+	return %torrent;
+}
+# sets torrent trackers in transmission
+# returns number of trackers set
+sub setTorrentTrackers($)
+{
+	my ($name) = @_;
+
+	my $ret=0;
+
+        return if (!$name);
+	if (!exists $TRACKERS[0])
+        {
+		&log(" - ERROR: empty tracker list");
+                return;
+        }
+
+	my $id;
+        if ($name =~ /^\d+$/)
+        {
+                $id = $name;
+        }
+        else
+        {
+                my $torrentInfo = &getTorrents($name);
+		if (!exists $torrentInfo->{'id'})
+		{
+			&log(" - ERROR: unable to lookup id to set trackers for $name");
+                	return 1;
+		}
+                $id = $torrentInfo->{'id'};
+        }
+
+	&log("Setting torrent trackers for torrent: $name, id: $id, trackers: ". join(',', @TRACKERS), 1);
+
+	my %currentTrackers = &getTorrentTrackers($id);
+	# remove current trackers and then add @trackers
+	foreach my $tracker ( sort {$b <=> $a } keys %currentTrackers )
+	{
+		my $out = `$LIB_transmission_remote --torrent $id --tracker-remove $tracker 2>&1`;
+	}
+
+	# set trackers
+	foreach my $tracker ( @TRACKERS )
+	{
+		my $trackerUrl = "http://$tracker:$PORT_opentracker/announce";
+		my $out = `$LIB_transmission_remote --torrent $id --tracker-add $trackerUrl 2>&1`;
+		if ($? > 0)
+		{
+			&log(" - WARNING: Unable to set tracker for torrent: $name, id: $id, tracker: $trackerUrl", 1);
+		}
+		else
+		{
+			$ret++;
+		}
+	}
+	return $ret;
+}
+sub getTorrent($)
+{
+	my ($name, $option) = @_;
+
+	if ($option ne 'raw')
+	{
+		return &getTorrents($name);
+	}
+
+	my $id;
+	if ($name =~ /^\d+$/)
+	{
+		$id = $name;
+	}
+	else	
+	{
+		my %torrents = &getTorrents();	
+		if (!exists $torrents{$name})
+		{
+			&log(" - ERROR: Torrent '$name' does not exist!", 1) if ($option eq 'raw');
+			return;
+		}
+		$id = $torrents{$name}{'id'};
+	}
+
+	
+	my $out = `$LIB_transmission_remote --torrent $id --info 2>&1`;
+	if ($? > 0)
+	{
+		&log(" - ERROR: Unable to get information for torrent: $name, id: $id", 1) if ($option eq 'raw');
+		return;	
+	}
+	if ($option eq 'raw')
+	{
+		chomp($out);
+		# lookup trackers as well
+		$out .= "$HR";
+		my $tout .= &getTorrentTrackers($id, 'raw');
+		if ($tout)
+		{
+			$out .= $tout;
+		}
+		else
+		{
+			$out .= "\nWARNING: NO TRACKERS SET!\n\n"
+		}
+		return $out;
+	}
+
+	my %torrent;
+	foreach my $line ( split("\n", $out) )
+	{
+		next if ($line !~ /\s+(.*?):\s+(.*)/);
+		$torrent{lc($1)} = $2;	
+	}
+	return %torrent;
+}
+
+# option can be  'raw' or 'queue' or 'transmission'
+# raw retrieves output from cmd 
+# base does not retrieve at all and just looks at base directory
+# if transmission does not respond, it fakes by looking at base directory
+sub getTorrents
+{
+	my $name = shift || '';
+	my $option = shift;
+
+	if ($option eq 'raw')
+	{
+		my $raw = `$LIB_transmission_remote --list 2>&1`;
+		if ($? > 0)
+                {
+                        &log(" - ERROR: Unable to retrieve torrents list", 1);
+                        return;
+                }
+		my $out;
+		my $ret = 0;
+		my $nameFound = 0;
+		foreach my $line ( split("\n", $raw) )
+		{ 
+			if ($line =~ /^\s+\d+.*?\s+(\S+)\.(\d+)$/)
+			{
+				next if ($name && $name ne $1);
+				$nameFound=1;
+				my ($tname, $tversion) = ($1, $2);
+
+				# get version on disk
+                                my $version = &getVersion($tname);
+				my $source = &getSource("$DATA/$tname/.deploy");
+				my $status = &getStatus($tname); ($status) = ($status =~ /:(.*)$/);
+                                if ($tversion != $version)
+                                {
+					my $tsource = &getSource("$BASE/$tname.$tversion");
+					$line =~ s/$tname\.$tversion/$tname\t\t$version-$source -> $tversion-$tsource/;
+                                }
+				else
+				{
+					$line =~ s/$tname\.$tversion/$tname\t\t$tversion-$source/;
+				}
+				$line .= " $status";
+			}
+			elsif ($line =~ /Name$/)
+			{
+				$line .= "\t\tVersion";
+			}
+			$out .= "$line\n";
+		}
+		if ($name && !$nameFound)
+		{
+			print "ERROR: '$name' not found!\n";
+			return 1;
+		}
+		elsif (!$nameFound)
+		{
+			print "WARNING: No current torrents found!\n";	
+			return 1;
+		}
+		print $out;
+		return 0;
+	}
+
+	my $content;
+
+	my $mode;
+	if ($option eq 'queue')
+	{
+		$content = &getTorrentsQueue();
+		$mode = 'queue';
+	}
+	else
+	{
+		# clientTransmission is not reliable
+ 		$content = &clientTransmission(
+		{	
+			method => "torrent-get",
+                	arguments => { 'fields' => ['id', 'name', 'status', 'comment'] }
+        	});	
+		$mode = 'transmission';
+	}
+
+	# if clientTransmission does not return anything it probably means that transmission is either busy or crashed
+	# either way we need to fake our way until daemon restarts it by looking up queue directory and filling out the info
+	if (!exists $content->{'arguments'}->{'torrents'} && $option ne 'transmission')
+	{	
+		$content = &getTorrentsQueue();
+		$mode = 'queue';
+	}
+
+	my %torrents;
+	foreach my $torrent ( @{$content->{'arguments'}->{'torrents'}} )
+	{
+		next if ($torrent->{'name'} !~ /(.*?)\.(\d+)/);
+		my ($tname, $tversion) = ($1, $2);
+		my $lversion = &getVersion($tname);
+		my $source = 'UNKNOWN';
+
+		my $id = $torrent->{'id'};
+		my $status = $torrent->{'status'};
+		
+		# cache it for queue mode if it came form trans
+		if ($mode eq 'transmission')
+		{
+			my $i;
+			open(file, ">$BASE/$tname.$tversion/id");
+			print file "$id\n";
+			close(file);
+			
+			my $state = "$DATA/$tname/.deploy/state";
+                	mkdir "$DATA/$tname/.deploy" if (! -d "$DATA/$tname/.deploy");
+                	open(f, $state);
+                       	my $string = <f>;
+                	close(f);
+                	if ($string =~ /^\d+:transferring /)
+                	{
+                        	open(f, ">$state");
+                               	print f "$tversion:trasferring $status%\n";
+                        	close(f);
+                	}
+			($source) = ($torrent->{'comment'} =~ /host:(.*?) /);
+			open(f, ">$BASE/$tname.$tversion/source");
+			print f $source;	
+			close(f);
+		}
+		$source = "UNKNOWN" if (!$source);
+
+		if ($name && $name eq $tname)
+		{
+			return                  { 'id' => $id, 'status' => $status, 'version' => $tversion, 'name' => $tname, 'lversion' => $lversion, 'source' => $source };
+		}
+		$torrents{"$tname.$tversion"} = { 'id' => $id, 'status' => $status, 'version' => $tversion, 'name' => $tname, 'lversion' => $lversion, 'source' => $source };
+		# only enter the latest
+		$torrents{$tname} =             { 'id' => $id, 'status' => $status, 'version' => $tversion, 'name' => $tname, 'lversion' => $lversion, 'source' => $source }
+			 if (!exists $torrents{$tname} || $torrents{$tname}{'version'} <= $torrents{"$tname.$tversion"}{'version'});
+	}	
+	return %torrents;
+}
+# subroutine for getTorrents
+sub getTorrentsQueue()
+{
+	my $content = { 'result' => 'queue', 'arguments' => { 'torrents' => [] } }; 
+        foreach my $f (<$QUEUE/*.torrent>)
+        {
+                my $f = basename($f);
+                next if ($f !~ /(.*?)\.(\d+)\.torrent/);
+                my ($t, $v) = ($1, $2);
+		my $id = 0;
+		if ( -f "$BASE/$t.$v/id")
+		{
+			open(file, "$BASE/$t.$v/id");
+			$id = <file>; chomp($id);
+			close(file);
+		}
+		my $source = "UNKNOWN";
+		if ( -f "$BASE/$t.$v/source")
+                {
+                        open(file, "$BASE/$t.$v/source");
+                        $source = <file>; chomp($source);
+                        close(file);
+                }
+		my $lversion = &getVersion($t);
+		push( @{$content->{'arguments'}->{'torrents'}}, { 'id' => $id, 'status' => 'UNKNOWN', 'version' => $v, 'name' => "$t.$v", 'lversion' => $lversion, 'source' => $source } );
+        }
+	return $content;
+}
+
+sub startIfNotRunning()
+{
+	eval 
+	{
+		`$0 start 2>&1 >/dev/null`;
+	}
+}
+sub start
+{
+	if (&checkProcess("deploy-daemon"))
+        {
+                print "DEPLOY already running, aborting!\n";
+		print "$out\n";
+		exit 1;
+        }
+
+	# Check if we are already running
+        if (&isrunning($MYPIDFILE))
+        {
+                print "DEPLOY already running, aborting!\n";
+		print "$out\n";
+		&status();
+                exit 1;
+        } 
+
+	&getTrackers();
+        &log("DEPLOY Starting with trackers: ". join(',', @TRACKERS), 1);
+
+	my $daemon = Proc::Daemon->new(
+                                work_dir => dirname($SELF),
+                                pid_file => $MYPIDFILE,
+				exec_command => './'. basename($SELF) .'-daemon' 
+        );
+	$daemon->Init();
+
+	return 0;
+}
+sub daemon()
+{
+	&getTrackers();
+
+	my $every = $CYCLETIME / 4;
+	my $i=0;
+	for(;;)
+	{
+		# rotate log files and restart children ever midnight
+                &logrotate(1);
+		&confupdate();
+
+		# check if tracker functions are running, if not then start
+		if ($i % 5 == 0)
+		{
+			&log("Pinging child processes.");
+			&children();
+		}
+		# retry updating trackers only if it failed recently
+                &retryTrackers();
+
+		# check queues every quarter of time, ie: CYCLETIME=1 minute, check every 15 seconds
+		for (my $j=0; $j < 4; $j++)
+		{
+			&syncTorrents();
+			sleep $every;
+		}
+
+		$i++;
+	}
+	exit;
+}
+sub shutdown()
+{
+	&unlock();
+	exit;
+}
+sub checkProcess($)
+{
+        my ($name) = @_;
+
+        my @found;
+        foreach my $line ( split("\n", `$PS -auxwww 2>/dev/null`) )
+        {
+                next if ($line !~ /^(\S+)\s+(\d+).*$name/);
+                push(@found, $2);
+        }
+        return @found;
+}
+sub rebuild()
+{
+	&log("DEPLOY rebuilding transmission...", 1);
+	&stopTransmission();
+	File::Path::rmtree("$TMP/.transmission");
+	&startTransmission();	
+	&log("DEPLOY rebuild is done.", 1);
+	return 0;
+}
+
+sub stop()
+{
+	my $ret=0;
+	&log("DEPLOY stopping...", 1);
+	my @pids = &checkProcess("deploy-daemon");
+	if (@pids)
+	{
+		foreach my $pid ( @pids )
+		{
+			&sendpid($pid);
+		}
+	}
+	else
+	{
+		&log("DEPLOY not running? pid file $MYPIDFILE not found.", 1);
+		$ret=5;
+	}
+	
+	if (&isTracker())
+	{
+		&log(" - Stopping tracker...", 1);
+		&stopTracker();
+	}
+
+	&stopTransmission();
+
+	if ($ret == 0)
+	{
+		&log("DEPLOY Stopped.", 1);
+	}
+	else
+	{
+		&log("failed.", 1);
+	}
+	return $ret;
+}
+
+sub tstatus()
+{
+	my $data = shift || 0;	
+	# get status about specific torrent
+        if ($data)
+        {
+                my $out = &getTorrent($data, 'raw');
+                exit 3 if (!$out);
+                print $out;
+        }
+	else
+	{
+		my $out = &getTorrents('', 'raw');
+                exit 3 if (!$out);
+                print $out;
+	}
+	exit 0;
+}
+
+sub status()
+{
+	my $data = shift || 0;
+	# get status about specific torrent
+	if ($data)
+	{
+		my $ret = &getTorrents($data, 'raw');
+		exit $ret;
+	}
+
+	my $ret=0;
+	my @pids = &checkProcess("deploy-daemon");
+	if (@pids)
+	{
+		if (!$quiet)
+		{
+			print "DEPLOY running: ". join(',', @pids) .".";
+			my ($lockSince, $lockType) = &statlock();
+			print " LOCKED: $lockType since ". localtime($lockSince) if ($lockSince);
+			print "\n";
+		}
+
+		&getTrackers();
+		print "Trackers: ". join(', ', @TRACKERS) ."\n";
+
+		# print out configured torrents
+                my (@alltorrents, @mytorrents);
+                foreach my $t ( keys %{$CONFIG->{DEPLOY}} )
+                {
+                        push(@alltorrents, $t);
+                        push(@mytorrents, $t) if (&isTorrent($t));
+                }
+                if (exists $CONFIG->{MAIN}->{onlyInDeploy}->{true})
+                {
+                        print "Valid torrents only: ". join(',', sort @alltorrents) ."\n";
+                }
+                print "My torrents: ". join(',', sort @mytorrents) ."\n";
+	}
+	else
+	{
+		print "DEPLOY not running\n" if (!$quiet);
+		$ret++;
+	}
+
+	if (&isTracker())
+        {
+                my @pids = &statusTracker();
+		if (!$pids[0])
+		{
+			print " - rsync process is not running!\n";
+			$ret++;
+		}
+		if (!$pids[1])
+		{
+			print " - opentracker process is not running!\n";
+			$ret++;
+		}
+                print " - tracker processes: rsync($pids[0]), opentracker($pids[1])\n" if ($pids[0] || $pids[1]);
+        }
+
+	my $tpid = join(',', &statusTransmission());
+	if (!$tpid && $ret == 0)
+	{
+		print " - transmission process is not running\n";
+		$ret++;
+	}
+	else
+	{
+		if (!$tpid) { print " - transmmission process is not running!\n" }
+		else 
+		{ 
+			print " - transmission process: $tpid\n"; 
+			# get a list of torrents
+			print "$HR\n";
+			$ret = &getTorrents('', 'raw');
+		}
+	}
+
+	exit($ret);
+}
+
+# check if certain pid is running
+# if running, it returns pid
+sub isrunning($)
+{
+        my ($pidfile) = @_;
+
+	if ( $pidfile =~ /^\// && -f $pidfile)
+	{	
+		my $daemon = Proc::Daemon->new();
+		open(file, $pidfile);
+		my $pid = <file>;
+		chomp($pid);
+		close(file);
+		return $daemon->Status($pid);
+	}
+	
+	return 0;
+}
+sub sendpid
+{
+	my $pid = shift;
+	my $sig = shift || KILL;
+
+	my $daemon = Proc::Daemon->new();
+	if ($pid =~ /\// && -f $pid)
+	{
+		open(file, $pid);
+                my $p = <file>;
+                chomp($p);
+                close(file);	
+		return $daemon->Kill_Daemon($p, $sig);	
+	}
+	elsif ($pid =~ /\d+/)
+	{
+		return $daemon->Kill_Daemon($pid, $sig);
+	}
+	return 0;
+}
+
+# interface for ZIP, argument is deploy name
+sub compress($$$)
+{
+	my ($from, $name, $version) = @_;
+
+	my $prefix = "$BASE/$name.$version";
+        my $zip = "$prefix/$name.zip";
+
+	my $cversion = &getVersion($name);
+	my $czip;
+	if ($cversion)
+	{
+		$czip = "$BASE/$name.$cversion/$name.zip" if (-f "$BASE/$name.$cversion/$name.zip");			
+	}
+
+	mkdir $prefix if (!-d $prefix);
+	my $out;
+	my $exclude=join(' ', @EXCLUDE);
+	
+	if ($czip)
+	{
+		&log("Compressing $from [$version] from $cversion", 1);
+                $out = `cd $from && $LIB_zip -FS --recurse-paths --symlinks -1 $czip . --out $zip -x $exclude 2>&1`;
+	}
+	else
+	{
+		&log("Compressing $from [$version] from scratch - average delay: 8min", 1);	
+		$out = `cd $from && $LIB_zip -FS --recurse-paths --symlinks -1 $zip . -x $exclude 2>&1`;
+	}
+        if ($? > 0)
+        {
+		#print "$out\n";
+		&log(" - ERROR: Unable to compress $from to $zip", 1);
+		File::Path::rmtree($prefix) if ($name && $prefix);
+		return 1;
+        }
+	if ($out =~ /Archive is current/)
+	{
+		&log(" - ERROR: Unable to deploy because $name is already current", 1);
+		File::Path::rmtree($prefix) if ($name && $prefix);
+		return 1;
+	}
+	return 0;
+}
+sub uncompress($)
+{
+        my ($name, $version) = @_;
+
+	my $data = "$DATA/$name";
+	my $prefix = "$BASE/$name.$version";
+	my $zip = "$prefix/$name.zip";
+
+	&log("Uncompressing $data [$version]");
+
+	if (! -f $zip)
+	{
+		&log(" - ERROR: Unable to find $zip to compress to $data");
+		return 1;
+	}
+
+	if (! -d $data)
+	{
+		mkdir $data;
+		if (! -d $data)
+		{
+			&log(" - ERROR: Unable to create $data directory uncompression");
+			return 1;
+		}
+	}
+
+	my @pids;
+        my $pid = fork();
+        if ($pid == 0)
+        {
+                my $out = `$LIB_unzip -u -o $zip -d $data`;
+		if ($? > 0)
+		{
+			&log(" - ERROR: Unable to uncompress $zip to $data: $LIB_unzip -u -o $zip -d $data");
+		}
+                exit;
+        }
+        push(@pids, "uncompress:$pid");
+
+        $pid = fork();
+        if ($pid == 0)
+        {
+		&log("Syncing files in $data");
+                my $files = {};
+		my $size=0;
+                open CMD, '-|' or exec $LIB_unzip, '-l', $zip;
+                while(<CMD>)
+                {
+                        /\d+\s+\d+-\d+-\d+ \d+:\d+\s+(.*)/;
+                        my @arr = split('/', $1);
+                        my $count = $#arr;
+                        my $ptr = $files;
+                        my $last =
+                        my $i=0;
+                        foreach my $x ( @arr )
+                        {
+                                $ptr->{$x} = {} if (!exists $ptr->{$x});
+                                $ptr = $ptr->{$x};
+				$size++;
+                                $i++;
+                        }
+                }
+                close CMD;
+		
+		if (!$size)
+		{
+			&log(" - ERROR: Unable to get file list from $zip for uncompression");
+			exit;
+		}
+
+                my @Dfiles;
+                &find($data, $files);
+                sub find 
+                {
+                        my $wdir = shift;
+                        my $ptr = shift;
+
+                        opendir(DIR, $wdir);
+                        foreach my $f (readdir(DIR) )
+                        {
+                                next if ($f eq '.' || $f eq '..' || $f eq '.deploy');
+
+                                if (!exists $ptr->{$f})
+                                {
+                                        push(@Dfiles, "$wdir/$f");
+                                }
+                                elsif (-d "$wdir/$f")
+                                {
+                                        &find("$wdir/$f", $ptr->{$f});
+                                        next;
+                                }
+                        }
+                        closedir(DIR);
+                }
+
+                File::Path::rmtree(\@Dfiles) if (@Dfiles);
+                exit;
+        }
+        push(@pids, "synchronize:$pid");
+
+        foreach my $p ( @pids )
+        {
+                my ($desc, $pid) = split(':', $p);
+                waitpid $pid, 0;
+        }
+
+	# Update version on data
+	&updateVersion($name, $version);
+
+	return 0;
+}
+
+# this runs when transmission is finished, we will uncompress and update version
+sub torrentDoneScript
+{
+	my $torrent = $ENV{'TR_TORRENT_NAME'};
+	if (!$torrent)
+	{
+		&log(" - ERROR: torrent-done-script: invalid 'TR_TORRENT_NAME' environment variable from transmission");
+		return 1;
+	}
+
+	my ($name, $version) = ($torrent =~ /(.*?)\.(\d+)$/);
+	if (!$torrent || !$version)
+	{
+		&log(" - ERROR: torrent-done-script: invalid name: '$torrent' or version: '$version'");
+		return 1;
+	}
+
+	&log("Running torrent-done-script for $name [$version]");
+	&updateVersion($name, $version);
+	&updateSource($name);
+
+	&updateStatus($name, "$version:uncompressing");
+
+	&uncompress($name, $version);			
+
+	&updateStatus($name, "$version:done");
+	&log("Complete torrent-done-script for $name [$version]");
+}
+
+sub updateSource()
+{
+	my $name = shift;
+        return if (!$name);
+
+	my $torrentInfo = &getTorrents($name);
+	my $source = $torrentInfo->{'source'}; 
+
+	my $dir = "$DATA/$name";
+        mkdir "dir/.deploy" if (! -d "$dir/.deploy");
+        open(f, ">$dir/.deploy/source");
+                print f "$source\n";
+        close(f);
+}
+sub getSource
+{
+	my $dir = shift;
+	return if (!$dir);
+
+	my $source = "UNKNOWN";
+	if ( -f "$dir/source")
+	{
+		open(f, "$dir/source");
+		$source = <f>; chomp($source);
+		close(f);
+	}
+	return $source;
+}

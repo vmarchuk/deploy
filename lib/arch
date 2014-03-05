@@ -1,0 +1,72 @@
+#!/bin/bash
+
+# description: automatic binary resolver for different architectures
+#              Expects real binaries to live in lib/$arch/
+#              arch can be a value from: $(uname -p | tr '[A-Z] ' '[a-z]_' | cut -d_ -f1)
+#              currently our arches are sparc or x86
+# author: walter
+
+RUN=$(env perl -e '
+	use File::Basename; 
+	use Cwd qw(abs_path chdir cwd);
+	$DEBUG=0;
+
+	# recursive loop until we find almost final link
+	$me = $ARGV[0];
+	while ( -l $me )
+	{
+		my $l1 = readlink($me);
+		my $mebase = basename($l1);
+		if ( $mebase eq "arch" )
+		{
+			$me = abs_path(dirname($me)) ."/". basename($me) if ($me !~ /^\//);
+			last;
+		}
+		my $me0 = $me;
+		$me = $l1;
+
+		$me = dirname("$me0") ."/". dirname($me) ."/".  $mebase if ($me !~ /^\//);
+	}
+
+	# redhat version detect
+	my $rev;
+	if ( -f "/etc/redhat-release" )
+	{
+		open(file, "/etc/redhat-release"); my $line = <file>; close(file);
+		($rev) = ($line =~ /release (\S+)/);
+		$rev = "redhat_$rev";
+	}
+
+	$self = basename($me);
+	$dir = dirname($me);
+	$base = basename($dir);
+	$prefix = dirname($dir);
+	$arch = lc(`uname -p | cut -d_ -f1`);
+	chomp($arch);
+	$arch =~ s/\s/ /g;
+	$archdir = abs_path("$prefix/lib/$arch");
+	$bin = abs_path("$archdir/$base/$self");
+
+	if ($DEBUG || ! -f "$bin" )
+	{
+		print "ARGV[0]: $ARGV[0]\n";
+		print "me: $me\n";
+		print "self: $self\n";
+		print "dir: $dir\n";
+		print "base: $base\n";
+		print "prefix: $prefix\n";
+		print "arch: $arch\n";
+		print "archdir: $archdir\n";
+		print "bin: $bin\n";
+		print "rev: $rev";
+	}
+	
+	die "Unable to find binaries for $arch in $dir\n" if (! -f "$bin" );
+
+	print "$archdir/lib:";
+	print "$archdir/lib/$rev" if (-d "$archdir/lib/$rev");	
+
+	print "#$self#$bin\n";
+' $0)
+
+LD_LIBRARY_PATH_64=$(echo $RUN | cut -d# -f1) LD_LIBRARY_PATH=$(echo $RUN | cut -d# -f1) exec -a "$(echo $RUN | cut -d# -f2)" "$(echo $RUN | cut -d# -f3)" "$@"
