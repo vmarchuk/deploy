@@ -1,4 +1,4 @@
-Deploy is an enterprise deployment via Bittorrent.  It was designed for fast transfer of large amount of data over many hosts.
+Deploy is an enterprise deployment via Bittorrent.  Designed for fast transfer of large amount of data over many hosts.
 
 This script is an improved deployment over twitter's murder(https://github.com/lg/murder) and Herd(https://github.com/russss/Herd).
 Its designed to be self contained, easy to use and many other features.
