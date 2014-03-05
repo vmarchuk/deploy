@@ -18,6 +18,7 @@ Requirements:
 * Zip - http://www.info-zip.org
 
 Technical Details:
+```
   Deploy uses several programs: transmission, opentracker, rsync and zip. Instead of reinventing the wheel, deploy is using 
   'transmission' as its torrent program.  Opentracker is used as a lightweight tracker.  Rsync is used for distribution of torrent files.
   Zip is used for compressing data to speedup overall process.
@@ -31,9 +32,11 @@ Technical Details:
   is told to start seeding.  Tracker is contacted next via rsync.  The rest of the hosts on the network connect to tracker every 15 seconds(default). 
   As soon as they contact tracker, they will notice that a new torrent is created, will download the torrent file and have transmission start the
   torrent download.
+```
 
 Configuration details:
   Default location is /usr/local/deploy.  
+```
   Main configuration file (written as perl include): etc/deploy-system.conf
 	APP_BASE: main location where all data lives, its a good idea for this location to have plenty of disk space
 	LOGDIR: location where all log files are kept
@@ -62,8 +65,10 @@ Configuration details:
   	This file should not be touched unless you know what you are doing.
   Opentracker (used as template during startup): etc/opentracker.conf
   	This file should not be touched unless you know what you are doing.
+```
 
 Install and Usage:
+```
   Install deploy in /usr/local/deploy.
   Make sure you have firewall holes for ports: 6998-7000.  These ports are configurable in etc/deploy-system.conf
   Modify /usr/local/deploy/etc/deploy-system.conf and set @TRACKERS with hostnames of hosts responsible for seeding, ie: your depot hosts
@@ -77,3 +82,4 @@ Install and Usage:
   'versionid' can be retrieved during 'deploy add' process
 
   To remove bar, run 'deploy delete bar'.
+```
