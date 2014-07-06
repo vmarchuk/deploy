@@ -1,4 +1,4 @@
-#!/usr/bin/env perl
+#!/sites/utils/perl/bin/perl
 # Deploy via torrent 
 #
 
@@ -120,7 +120,7 @@ sub usage()
 	print "restart   Restarts deploy daemon.\n";
 	print "add       Add a new torrent or recompile a new torrent.\n";
 	print "          Name needs to exist in $DATA or use from SRCDIR\n";
-	print "delete    Delete torrent from $DATA\n";
+	print "delete    Delete torrent ro $DATA\n";
 	print "status    Shows status of deploy and all existing torrents.\n";
 	print "          Will display status for one name if name argument is supplied.\n";
 	print "tstatus   Shows status of torrents.\n";
@@ -135,25 +135,6 @@ sub usage()
 	print "Trackers: $HOOKS/tracker.sh\n";
 	print "If self host is tracker, deploy will run as tracker as well.\n";
 	print "Trackers will be notified when there's a new deployment. All hosts will check on trackers to see if new deployment exists.\n"
-}
-sub failenv
-{
-	my $file = shift;
-	my $desc = shift; chomp($desc);
-	print "Unable to find $file!\n";
-	print "$desc\n" if ($desc);
-	print "Deploy requires transmission, rsync, opentracker, zip to be installed!\n";
-	print "Paths are configured in deploy-system.conf\n";
-	print "Transmission: http://www.transmissionbt.com/\n";
-	print "Rsync: http://rsync.samba.org/\n";	
-	print "Opentracker: https://erdgeist.org/arts/software/opentracker/\n";
-	print "Zip: http://www.info-zip.org/\n";
-	print "$HR\n";
-	print "Either install them on your system or compile them.\n";
-	print "If compiling you can put your packages in lib/packagename/\$ARCH/lib/bin/\n";
-	print "All src files are available in src/\n";
-	print "$HR\n";
-	exit 255;
 }
 
 sub setupenv()
@@ -189,33 +170,23 @@ sub setupenv()
 	our $MYPIDFILE_opentracker = "$TMP/.rsync.opentracker.pid";
 	our $MYPIDFILE_transmission = "$TMP/.deploy.transmission.pid";
 
-	mkdir("$PREFIX/libexec") if (! -d "$PREFIX/libexec");
+	our $LIB_zip="$LIB/zip/bin/zip";
+	our $LIB_unzip="$LIB/zip/bin/unzip";
+	our $LIB_rsync="$LIB/rsync/bin/deploy-rsync";
+	our $LIB_opentracker="$LIB/opentracker/bin/deploy-opentracker";
+	our $LIB_transmission="$LIB/transmission/bin/deploy-transmission-daemon";
 
-	# look for required programs
-        foreach my $req (keys %REQUIRED)
-        {
-		my $path;
-		foreach my $f ( @{$REQUIRED{$req}} )
-		{
-			chomp($f); # just in case
-			next if (! -x $f);
-			$path = $f;
-			last;
-		}	
-		&failenv($req, "Possible paths: ". join(', ', @{$REQUIRED{$req}})) if (!$path);
+	our $LIB_transmission="$LIB/transmission/bin/deploy-transmission-daemon";
+	our $LIB_transmission_create="$LIB/transmission/bin/deploy-transmission-create";
+	our $LIB_transmission_remote="$LIB/transmission/bin/deploy-transmission-remote 127.0.0.1 -n deploy:$API";
+	our $LIB_transmission_cli="$LIB/transmission/bin/deploy-transmission-cli";
+	our $LIB_transmission_edit="$LIB/transmission/bin/deploy-transmission-edit";
+	our $LIB_transmission_show="$LIB/transmission/bin/deploy-transmission-show";
 
-		# create symlink to libexec
-		my $newpath="$PREFIX/libexec/deploy-". basename($path);
-		unlink($newpath) if (-e $newpath && $path ne readlink($newpath));
-		symlink($path, $newpath);
-		&failenv($req, "Unable to create symlink $newpath") if (! -e $newpath);
-		$$req=$newpath;
-        }
-
-	# extra arguments
-	$LIB_transmission_remote .= " 127.0.0.1 -n deploy:$API";
-
+	# process DEPLOY configuration
+	
 	&logrotate();
+
 	&confupdate();
 }
 sub children
@@ -424,8 +395,6 @@ sub hook($)
 # if we are a tracker, then make sure we are running 
 sub getTrackers()
 {
-	return if (@TRACKERS);
-
 	our @TRACKERS = split("\n", &hook('tracker'));
 }
 sub isTracker()
@@ -744,11 +713,9 @@ sub startTransmission()
 
 			unlink($MYPIDFILE_transmission) if ( -f $MYPIDFILE_transmission);
 
-			my $cmd = "$LIB_transmission --config-dir $TMP/.transmission --no-watch-dir --no-incomplete-dir --no-portmap --no-lpd --no-dht -P $PORT_transmission --download-dir $BASE -t -u deploy --rpc-bind-address 127.0.0.1 --pid-file $MYPIDFILE_transmission --logfile=$LOGFILE_transmission";
-			#&log($cmd);
                 	our $DAEMON_transmission = Proc::Daemon->new(
                         	work_dir => $dir,
-				exec_command => $cmd
+                        	exec_command => "$LIB_transmission --config-dir $TMP/.transmission --no-watch-dir --no-incomplete-dir --no-portmap --no-utp --no-lpd --no-dht -P $PORT_transmission --download-dir $BASE -t -u deploy --rpc-bind-address 127.0.0.1 --pid-file $MYPIDFILE_transmission --logfile=$LOGFILE_transmission"
                 	);
 			$DAEMON_transmission->Init;
                 	if ($DAEMON_transmission->Status())
@@ -1349,7 +1316,7 @@ sub delTorrent
 # if empty, then sync whole directory
 sub syncTorrents()
 {
-	my $sync=0;
+	my $sync='0';
 	my $syncVersion=0;
 	my (%qtorrents, %dtorrents);
 
@@ -1400,7 +1367,7 @@ sub syncTorrents()
 		#&log("USER=deploy $LIB_rsync --contimeout=2 --timeout=2 -a -iO --update --delete --dry-run --port $PORT_rsync --password-file=$APIFILE ${tracker}::DEPLOY/.version $QUEUE/ 2>&1");
                 my $out = `USER=deploy $LIB_rsync --contimeout=2 --timeout=2 -a -iO --update --delete --dry-run --port $PORT_rsync --password-file=$APIFILE ${tracker}::DEPLOY/.version $QUEUE/ 2>&1`;
 		my $ret = $?;
-                if ($ret > 0)
+		if ($ret > 0 || $out =~ /rsync error/)
                 {
 			push(@errors, "$tracker:$ret");
                         next;
@@ -1415,7 +1382,7 @@ sub syncTorrents()
 		#&log("USER=deploy $LIB_rsync --contimeout=2 --timeout=2 -a -iO --delete --port $PORT_rsync --password-file=$APIFILE --include='/.version' --include='/*.torrent' --exclude='*' ${tracker}::DEPLOY/ $QUEUE/ 2>&1");
                 $out = `USER=deploy $LIB_rsync --contimeout=2 --timeout=2 -a -iO --delete --port $PORT_rsync --password-file=$APIFILE --include='/.version' --include='/*.torrent' --exclude='*' ${tracker}::DEPLOY/ $QUEUE/ 2>&1`;
 		my $ret = $?;
-                if ($ret > 0)
+		if ($ret > 0 || $out =~ /rsync error/)
                 {
                         &log("ERROR: unable to sync queue from tracker: $tracker:$ret\n");
                 }
@@ -2132,7 +2099,7 @@ sub status()
 		}
 
 		&getTrackers();
-		print "Trackers: ". join(', ', @TRACKERS) ."\n";
+		print "Trackers: ". join(',', @TRACKERS) ."\n";
 
 		# print out configured torrents
                 my (@alltorrents, @mytorrents);
